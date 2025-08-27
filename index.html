@@ -52,12 +52,53 @@
 
         // Utility functions
         const generateId = () => Math.random().toString(36).substr(2, 9);
-        
+
+        const timeToMinutes = (time) => {
+            const [hours, minutes] = time.split(":").map(Number);
+            return hours * 60 + minutes;
+        };
+
+        const minutesToTime = (mins) => {
+            const hours = Math.floor(mins / 60);
+            const minutes = mins % 60;
+            return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+        };
+
         const generateTimeSlots = () => {
             const slots = [];
             for (let hour = 9; hour < 17; hour++) {
                 for (let minute = 0; minute < 60; minute += 30) {
-                    slots.push({ hour, minute });
+const generateTimeSlots = () => {
+  const slots = [];
+  for (let hour = 9; hour < 17; hour++) {
+    for (let minute = 0; minute < 60; minute += 30) {
+      // store as integer minutes since midnight
+      slots.push(hour * 60 + minute);
+    }
+  }
+  return slots;
+};
+
+// 12-hour display; accepts integer minutes or {hour, minute}
+const formatTime = (time) => {
+  let mins;
+  if (typeof time === 'number') {
+    mins = time;
+  } else if (time && typeof time === 'object') {
+    mins = (time.hour || 0) * 60 + (time.minute || 0);
+  } else {
+    mins = 0;
+  }
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  const dt = new Date(Date.UTC(1970, 0, 1, h, m));
+  return new Intl.DateTimeFormat('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true
+  }).format(dt);
+};
+
                 }
             }
             return slots;
@@ -90,12 +131,39 @@
         };
 
         const formatDate = (date) => {
-            return date.toLocaleDateString('en-US', { 
-                weekday: 'long', 
-                year: 'numeric', 
-                month: 'long', 
-                day: 'numeric' 
+            return date.toLocaleDateString('en-US', {
+                weekday: 'long',
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric'
             });
+        };
+
+        // Convert various time formats to canonical HH:mm
+        const canonicalizeTime = (time) => {
+            const canonicalMatch = /^([01]\d|2[0-3]):([0-5]\d)$/;
+            if (canonicalMatch.test(time)) return time;
+
+            const legacyMatch = /^(\d{1,2}):(\d{2})\s*(AM|PM)$/i;
+            let match = legacyMatch.exec(time);
+            if (match) {
+                let hour = parseInt(match[1], 10);
+                const minute = match[2];
+                const period = match[3].toUpperCase();
+                if (period === 'PM' && hour !== 12) hour += 12;
+                if (period === 'AM' && hour === 12) hour = 0;
+                return `${hour.toString().padStart(2, '0')}:${minute}`;
+            }
+
+            const shortMatch = /^(\d{1,2}):(\d{2})$/;
+            match = shortMatch.exec(time);
+            if (match) {
+                const hour = parseInt(match[1], 10);
+                const minute = match[2];
+                return `${hour.toString().padStart(2, '0')}:${minute}`;
+            }
+
+            return time;
         };
 
         // Loading Component
@@ -123,10 +191,18 @@
             const loadSchedules = async () => {
                 try {
                     const snapshot = await db.collection('schedules').get();
-                    const schedulesData = snapshot.docs.map(doc => ({
-                        id: doc.id,
-                        ...doc.data()
-                    }));
+                    const schedulesData = snapshot.docs.map(doc => {
+                        const data = doc.data();
+                        if (data.bookedSlot && typeof data.bookedSlot.time === 'string') {
+                            data.bookedSlot.time = timeToMinutes(data.bookedSlot.time);
+                        }
+                        if (data.candidateAvailability) {
+                            Object.entries(data.candidateAvailability).forEach(([dateKey, times]) => {
+                                data.candidateAvailability[dateKey] = times.map(t => typeof t === 'number' ? t : timeToMinutes(t));
+                            });
+                        }
+                        return { id: doc.id, ...data };
+                    });
                     setSchedules(schedulesData);
                 } catch (error) {
                     console.error('Error loading schedules:', error);
@@ -274,7 +350,12 @@
                                                 </p>
                                                 {schedule.bookedSlot && (
                                                     <div className="mt-2 inline-block bg-green-100 text-green-800 px-3 py-1 rounded-full text-sm font-medium">
-                                                        Interview Booked: {schedule.bookedSlot.date} at {formatTime(schedule.bookedSlot.time)}
+{schedule.bookedSlot && (
+  <div className="mt-2 inline-block bg-green-100 text-green-800 px-3 py-1 rounded-full text-sm font-medium">
+    Interview Booked: {schedule.bookedSlot.date} at {formatTime(schedule.bookedSlot.time)}
+  </div>
+)}
+
                                                     </div>
                                                 )}
                                             </div>
@@ -325,9 +406,70 @@
 
             const loadSchedule = async () => {
                 try {
-                    const doc = await db.collection('schedules').doc(scheduleId).get();
+                    const docRef = db.collection('schedules').doc(scheduleId);
+                    const doc = await docRef.get();
                     if (doc.exists) {
                         const scheduleData = doc.data();
+if (doc.exists) {
+  const scheduleData = doc.data();
+
+  // --- Normalize any stored times to integer "minutes since midnight" ---
+  if (scheduleData.candidateAvailability) {
+    Object.entries(scheduleData.candidateAvailability).forEach(([dateKey, times]) => {
+      scheduleData.candidateAvailability[dateKey] = times.map(t =>
+        typeof t === 'number' ? t : timeToMinutes(t)
+      );
+    });
+  }
+
+  if (scheduleData.bookedSlot && typeof scheduleData.bookedSlot.time === 'string') {
+    scheduleData.bookedSlot.time = timeToMinutes(scheduleData.bookedSlot.time);
+  }
+
+  // --- Canonicalize and write back if needed ---
+  const updates = {};
+
+  if (scheduleData.candidateAvailability) {
+    const normalized = {};
+    let changed = false;
+
+    for (const [date, times] of Object.entries(scheduleData.candidateAvailability)) {
+      normalized[date] = times.map(t => {
+        const canon = canonicalizeTime(t);
+        if (canon !== t) changed = true;
+        return canon;
+      });
+    }
+
+    if (changed) {
+      updates.candidateAvailability = normalized;
+      scheduleData.candidateAvailability = normalized;
+    }
+  }
+
+  if (scheduleData.bookedSlot?.time) {
+    const canon = canonicalizeTime(scheduleData.bookedSlot.time);
+    if (canon !== scheduleData.bookedSlot.time) {
+      scheduleData.bookedSlot.time = canon;
+      updates.bookedSlot = scheduleData.bookedSlot;
+    }
+  }
+
+  if (Object.keys(updates).length > 0) {
+    await docRef.update(updates);
+  }
+
+  // --- Keep the existing state updates ---
+  setSchedule(scheduleData);
+  setSelectedSlots(scheduleData.candidateAvailability || {});
+  setSubmitted(
+    !!(
+      scheduleData.candidateAvailability &&
+      Object.values(scheduleData.candidateAvailability || {}).length > 0
+    )
+  );
+}
+
                         setSchedule(scheduleData);
                         setSelectedSlots(scheduleData.candidateAvailability || {});
                         setSubmitted(Object.keys(scheduleData.candidateAvailability || {}).length > 0);
@@ -367,8 +509,12 @@
             const submitAvailability = async () => {
                 setSubmitting(true);
                 try {
+                    const normalized = {};
+                    Object.entries(selectedSlots).forEach(([dateKey, times]) => {
+                        normalized[dateKey] = times.map(t => typeof t === 'number' ? t : timeToMinutes(t));
+                    });
                     await db.collection('schedules').doc(scheduleId).update({
-                        candidateAvailability: selectedSlots
+                        candidateAvailability: normalized
                     });
                     setSubmitted(true);
                 } catch (error) {
@@ -401,7 +547,11 @@
                                 <div className="text-green-600 text-4xl mb-4">✅</div>
                                 <h3 className="text-xl font-semibold text-green-800 mb-2">Interview Confirmed!</h3>
                                 <p className="text-green-700">
-                                    Your interview is scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{formatTime(schedule.bookedSlot.time)}</strong>
+<p className="text-green-700">
+  Your interview is scheduled for <strong>{schedule.bookedSlot.date}</strong> at&nbsp;
+  <strong>{formatTime(schedule.bookedSlot.time)}</strong>
+</p>
+
                                 </p>
                             </div>
                         ) : (
@@ -433,9 +583,9 @@
                                                                     isSelected
                                                                         ? 'bg-blue-600 text-white'
                                                                         : 'bg-white border border-gray-300 text-gray-700 hover:bg-blue-50'
-                                                                }`}
-                                                            >
-                                                                {formatTime(time)}
+                                                                }`
+{formatTime(time)}
+
                                                             </button>
                                                         );
                                                     })}
@@ -482,9 +632,71 @@
 
             const loadSchedule = async () => {
                 try {
-                    const doc = await db.collection('schedules').doc(scheduleId).get();
+                    const docRef = db.collection('schedules').doc(scheduleId);
+                    const doc = await docRef.get();
                     if (doc.exists) {
-                        setSchedule(doc.data());
+                        const scheduleData = doc.data();
+if (doc.exists) {
+  const scheduleData = doc.data();
+
+  // --- Normalize any stored times to integer "minutes since midnight" ---
+  if (scheduleData.candidateAvailability) {
+    Object.entries(scheduleData.candidateAvailability).forEach(([dateKey, times]) => {
+      scheduleData.candidateAvailability[dateKey] = (times || []).map(t =>
+        typeof t === 'number' ? t : timeToMinutes(t)
+      );
+    });
+  }
+
+  if (scheduleData.bookedSlot && typeof scheduleData.bookedSlot.time === 'string') {
+    scheduleData.bookedSlot.time = timeToMinutes(scheduleData.bookedSlot.time);
+  }
+
+  // --- Canonicalize and write back if needed ---
+  const updates = {};
+
+  if (scheduleData.candidateAvailability) {
+    const normalized = {};
+    let changed = false;
+
+    for (const [date, times] of Object.entries(scheduleData.candidateAvailability)) {
+      normalized[date] = (times || []).map(t => {
+        const canon = canonicalizeTime(t);
+        if (canon !== t) changed = true;
+        return canon;
+      });
+    }
+
+    if (changed) {
+      updates.candidateAvailability = normalized;
+      scheduleData.candidateAvailability = normalized;
+    }
+  }
+
+  if (scheduleData.bookedSlot?.time != null) {
+    const canon = canonicalizeTime(scheduleData.bookedSlot.time);
+    if (canon !== scheduleData.bookedSlot.time) {
+      scheduleData.bookedSlot.time = canon;
+      updates.bookedSlot = scheduleData.bookedSlot;
+    }
+  }
+
+  if (Object.keys(updates).length > 0) {
+    await docRef.update(updates);
+  }
+
+  // --- Update component state (keep from main) ---
+  setSchedule(scheduleData);
+  setSelectedSlots(scheduleData.candidateAvailability || {});
+  setSubmitted(
+    !!(
+      scheduleData.candidateAvailability &&
+      Object.values(scheduleData.candidateAvailability).some(arr => (arr || []).length > 0)
+    )
+  );
+}
+
+                        setSchedule(scheduleData);
                     }
                 } catch (error) {
                     console.error('Error loading schedule:', error);
@@ -540,7 +752,8 @@
                                 <div className="text-green-600 text-4xl mb-4">✅</div>
                                 <h3 className="text-xl font-semibold text-green-800 mb-2">Interview Booked!</h3>
                                 <p className="text-green-700">
-                                    Interview scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{formatTime(schedule.bookedSlot.time)}</strong>
+Interview scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{formatTime(schedule.bookedSlot.time)}</strong>
+
                                 </p>
                             </div>
                         ) : Object.keys(availableSlots).length === 0 ? (
@@ -570,12 +783,12 @@
                                                 <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3">
                                                     {times.map(time => (
                                                         <button
-                                                            key={`${time.hour}-${time.minute}`}
+                                                            key={time}
                                                             onClick={() => bookSlot(dateKey, time)}
                                                             disabled={booking}
                                                             className="slot-button bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
-                                                        >
-                                                            {booking ? 'Booking...' : formatTime(time)}
+{booking ? 'Booking...' : formatTime(time)}
+
                                                         </button>
                                                     ))}
                                                 </div>
