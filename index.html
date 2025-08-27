@@ -1,21 +1,140 @@
-const formatTime = (time) => {
-    // Handles both {hour, minute} objects and numbers representing minutes since midnight
-    let hour, minute;
-    if (typeof time === 'object' && time !== null) {
-        hour = time.hour;
-        minute = time.minute;
-    } else if (typeof time === 'number') {
-        hour = Math.floor(time / 60);
-        minute = time % 60;
-    } else {
-        return time; // fallback
-    }
-    const date = new Date();
-    date.setHours(hour);
-    date.setMinutes(minute);
-    return date.toLocaleString('en-US', {
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true
-    });
-};
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interview Scheduler</title>
+    <!-- External Libraries -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .fade-in {
+            animation: fadeIn 0.3s ease-in;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .slot-button {
+            transition: all 0.2s ease;
+        }
+        .slot-button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-blue-50 to-indigo-100 min-h-screen">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // Firebase Configuration
+        const firebaseConfig = {
+            apiKey: "AIzaSyAD97WCKVxz8XGntwMsylvedKfPYUk_ga8",
+            authDomain: "interview-scheduling-app-477ff.firebaseapp.com",
+            projectId: "interview-scheduling-app-477ff",
+            storageBucket: "interview-scheduling-app-477ff.firebasestorage.app",
+            messagingSenderId: "667733211153",
+            appId: "1:667733211153:web:a172b3dcc69f6fe85859b0",
+            measurementId: "G-BBBEXSMS2H"
+        };
+
+        // Initialize Firebase
+        firebase.initializeApp(firebaseConfig);
+        const db = firebase.firestore();
+        const auth = firebase.auth();
+
+        const { useState, useEffect } = React;
+
+        // Utility functions
+        const generateId = () => Math.random().toString(36).substr(2, 9);
+
+        const timeToMinutes = (time) => {
+            const [hours, minutes] = time.split(":").map(Number);
+            return hours * 60 + minutes;
+        };
+
+        const minutesToTime = (mins) => {
+            const hours = Math.floor(mins / 60);
+            const minutes = mins % 60;
+            return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+        };
+
+        const generateTimeSlots = () => {
+            const slots = [];
+            for (let hour = 9; hour < 17; hour++) {
+                for (let minute = 0; minute < 60; minute += 30) {
+                    slots.push({ hour, minute });
+                }
+            }
+            return slots;
+        };
+
+        // Only ONE formatTime function
+        const formatTime = (time) => {
+            let hour, minute;
+            if (typeof time === 'object' && time !== null) {
+                hour = time.hour;
+                minute = time.minute;
+            } else if (typeof time === 'number') {
+                hour = Math.floor(time / 60);
+                minute = time % 60;
+            } else if (typeof time === 'string' && /^\d{2}:\d{2}$/.test(time)) {
+                [hour, minute] = time.split(":").map(Number);
+            } else {
+                return time; // fallback, show as-is
+            }
+            const date = new Date();
+            date.setHours(hour);
+            date.setMinutes(minute);
+            return date.toLocaleString('en-US', {
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true
+            });
+        };
+
+        const getNextWorkdays = (count = 7) => {
+            const days = [];
+            const today = new Date();
+            let current = new Date(today);
+            while (days.length < count) {
+                const dayOfWeek = current.getDay();
+                if (dayOfWeek !== 0 && dayOfWeek !== 6) { // Skip weekends
+                    days.push(new Date(current));
+                }
+                current.setDate(current.getDate() + 1);
+            }
+            return days;
+        };
+
+        const formatDate = (date) => {
+            return date.toLocaleDateString('en-US', {
+                weekday: 'long',
+                year: 'numeric',
+                month: 'long',
+                day: 'numeric'
+            });
+        };
+
+        // Example fix for event handlers in components:
+        // Replace any <input onChanged={...} /> with <input onChange={...} />
+        // Replace any <button onClicked={...} /> with <button onClick={...} />
+        // Replace any custom event names with proper React events
+
+        // ... (rest of your app code should remain, including all React components)
+        // If you have custom handlers, use standard event names or document their purpose
+
+        // Main App Component
+        // -- Your RecruiterDashboard, CandidatePortal, ClientBooking components go here unchanged --
+
+        // Render the app
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>
