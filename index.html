@@ -57,11 +57,21 @@
             const slots = [];
             for (let hour = 9; hour < 17; hour++) {
                 for (let minute = 0; minute < 60; minute += 30) {
-                    const time = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
-                    slots.push(time);
+                    slots.push({ hour, minute });
                 }
             }
             return slots;
+        };
+
+        const formatTime = ({ hour, minute }) => {
+            const date = new Date();
+            date.setHours(hour);
+            date.setMinutes(minute);
+            return new Intl.DateTimeFormat('en-US', {
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true
+            }).format(date);
         };
 
         const getNextWorkdays = (count = 7) => {
@@ -264,7 +274,7 @@
                                                 </p>
                                                 {schedule.bookedSlot && (
                                                     <div className="mt-2 inline-block bg-green-100 text-green-800 px-3 py-1 rounded-full text-sm font-medium">
-                                                        Interview Booked: {schedule.bookedSlot.date} at {schedule.bookedSlot.time}
+                                                        Interview Booked: {schedule.bookedSlot.date} at {formatTime(schedule.bookedSlot.time)}
                                                     </div>
                                                 )}
                                             </div>
@@ -331,15 +341,17 @@
 
             const toggleSlot = (date, time) => {
                 if (schedule.bookedSlot) return; // Prevent changes if interview is booked
-                
+
                 const dateKey = date.toISOString().split('T')[0];
                 const newSelectedSlots = { ...selectedSlots };
-                
+
                 if (!newSelectedSlots[dateKey]) {
                     newSelectedSlots[dateKey] = [];
                 }
-                
-                const slotIndex = newSelectedSlots[dateKey].indexOf(time);
+
+                const slotIndex = newSelectedSlots[dateKey].findIndex(
+                    t => t.hour === time.hour && t.minute === time.minute
+                );
                 if (slotIndex > -1) {
                     newSelectedSlots[dateKey].splice(slotIndex, 1);
                     if (newSelectedSlots[dateKey].length === 0) {
@@ -348,7 +360,7 @@
                 } else {
                     newSelectedSlots[dateKey].push(time);
                 }
-                
+
                 setSelectedSlots(newSelectedSlots);
             };
 
@@ -389,7 +401,7 @@
                                 <div className="text-green-600 text-4xl mb-4">✅</div>
                                 <h3 className="text-xl font-semibold text-green-800 mb-2">Interview Confirmed!</h3>
                                 <p className="text-green-700">
-                                    Your interview is scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{schedule.bookedSlot.time}</strong>
+                                    Your interview is scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{formatTime(schedule.bookedSlot.time)}</strong>
                                 </p>
                             </div>
                         ) : (
@@ -410,10 +422,12 @@
                                                 </h3>
                                                 <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3">
                                                     {timeSlots.map(time => {
-                                                        const isSelected = selectedSlots[dateKey]?.includes(time);
+                                                        const isSelected = selectedSlots[dateKey]?.some(
+                                                            t => t.hour === time.hour && t.minute === time.minute
+                                                        );
                                                         return (
                                                             <button
-                                                                key={time}
+                                                                key={`${time.hour}-${time.minute}`}
                                                                 onClick={() => toggleSlot(date, time)}
                                                                 className={`slot-button px-4 py-2 rounded-lg text-sm font-medium ${
                                                                     isSelected
@@ -421,7 +435,7 @@
                                                                         : 'bg-white border border-gray-300 text-gray-700 hover:bg-blue-50'
                                                                 }`}
                                                             >
-                                                                {time}
+                                                                {formatTime(time)}
                                                             </button>
                                                         );
                                                     })}
@@ -526,7 +540,7 @@
                                 <div className="text-green-600 text-4xl mb-4">✅</div>
                                 <h3 className="text-xl font-semibold text-green-800 mb-2">Interview Booked!</h3>
                                 <p className="text-green-700">
-                                    Interview scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{schedule.bookedSlot.time}</strong>
+                                    Interview scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{formatTime(schedule.bookedSlot.time)}</strong>
                                 </p>
                             </div>
                         ) : Object.keys(availableSlots).length === 0 ? (
@@ -556,12 +570,12 @@
                                                 <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3">
                                                     {times.map(time => (
                                                         <button
-                                                            key={time}
+                                                            key={`${time.hour}-${time.minute}`}
                                                             onClick={() => bookSlot(dateKey, time)}
                                                             disabled={booking}
                                                             className="slot-button bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
                                                         >
-                                                            {booking ? 'Booking...' : time}
+                                                            {booking ? 'Booking...' : formatTime(time)}
                                                         </button>
                                                     ))}
                                                 </div>
