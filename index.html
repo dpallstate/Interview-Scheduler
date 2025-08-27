@@ -52,13 +52,23 @@
 
         // Utility functions
         const generateId = () => Math.random().toString(36).substr(2, 9);
-        
+
+        const timeToMinutes = (time) => {
+            const [hours, minutes] = time.split(":").map(Number);
+            return hours * 60 + minutes;
+        };
+
+        const minutesToTime = (mins) => {
+            const hours = Math.floor(mins / 60);
+            const minutes = mins % 60;
+            return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+        };
+
         const generateTimeSlots = () => {
             const slots = [];
             for (let hour = 9; hour < 17; hour++) {
                 for (let minute = 0; minute < 60; minute += 30) {
-                    const time = `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
-                    slots.push(time);
+                    slots.push(hour * 60 + minute);
                 }
             }
             return slots;
@@ -113,10 +123,18 @@
             const loadSchedules = async () => {
                 try {
                     const snapshot = await db.collection('schedules').get();
-                    const schedulesData = snapshot.docs.map(doc => ({
-                        id: doc.id,
-                        ...doc.data()
-                    }));
+                    const schedulesData = snapshot.docs.map(doc => {
+                        const data = doc.data();
+                        if (data.bookedSlot && typeof data.bookedSlot.time === 'string') {
+                            data.bookedSlot.time = timeToMinutes(data.bookedSlot.time);
+                        }
+                        if (data.candidateAvailability) {
+                            Object.entries(data.candidateAvailability).forEach(([dateKey, times]) => {
+                                data.candidateAvailability[dateKey] = times.map(t => typeof t === 'number' ? t : timeToMinutes(t));
+                            });
+                        }
+                        return { id: doc.id, ...data };
+                    });
                     setSchedules(schedulesData);
                 } catch (error) {
                     console.error('Error loading schedules:', error);
@@ -264,7 +282,7 @@
                                                 </p>
                                                 {schedule.bookedSlot && (
                                                     <div className="mt-2 inline-block bg-green-100 text-green-800 px-3 py-1 rounded-full text-sm font-medium">
-                                                        Interview Booked: {schedule.bookedSlot.date} at {schedule.bookedSlot.time}
+                                                        Interview Booked: {schedule.bookedSlot.date} at {minutesToTime(schedule.bookedSlot.time)}
                                                     </div>
                                                 )}
                                             </div>
@@ -318,6 +336,14 @@
                     const doc = await db.collection('schedules').doc(scheduleId).get();
                     if (doc.exists) {
                         const scheduleData = doc.data();
+                        if (scheduleData.candidateAvailability) {
+                            Object.entries(scheduleData.candidateAvailability).forEach(([dateKey, times]) => {
+                                scheduleData.candidateAvailability[dateKey] = times.map(t => typeof t === 'number' ? t : timeToMinutes(t));
+                            });
+                        }
+                        if (scheduleData.bookedSlot && typeof scheduleData.bookedSlot.time === 'string') {
+                            scheduleData.bookedSlot.time = timeToMinutes(scheduleData.bookedSlot.time);
+                        }
                         setSchedule(scheduleData);
                         setSelectedSlots(scheduleData.candidateAvailability || {});
                         setSubmitted(Object.keys(scheduleData.candidateAvailability || {}).length > 0);
@@ -355,8 +381,12 @@
             const submitAvailability = async () => {
                 setSubmitting(true);
                 try {
+                    const normalized = {};
+                    Object.entries(selectedSlots).forEach(([dateKey, times]) => {
+                        normalized[dateKey] = times.map(t => typeof t === 'number' ? t : timeToMinutes(t));
+                    });
                     await db.collection('schedules').doc(scheduleId).update({
-                        candidateAvailability: selectedSlots
+                        candidateAvailability: normalized
                     });
                     setSubmitted(true);
                 } catch (error) {
@@ -389,7 +419,7 @@
                                 <div className="text-green-600 text-4xl mb-4">✅</div>
                                 <h3 className="text-xl font-semibold text-green-800 mb-2">Interview Confirmed!</h3>
                                 <p className="text-green-700">
-                                    Your interview is scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{schedule.bookedSlot.time}</strong>
+                                    Your interview is scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{minutesToTime(schedule.bookedSlot.time)}</strong>
                                 </p>
                             </div>
                         ) : (
@@ -421,7 +451,7 @@
                                                                         : 'bg-white border border-gray-300 text-gray-700 hover:bg-blue-50'
                                                                 }`}
                                                             >
-                                                                {time}
+                                                                {minutesToTime(time)}
                                                             </button>
                                                         );
                                                     })}
@@ -470,7 +500,16 @@
                 try {
                     const doc = await db.collection('schedules').doc(scheduleId).get();
                     if (doc.exists) {
-                        setSchedule(doc.data());
+                        const scheduleData = doc.data();
+                        if (scheduleData.candidateAvailability) {
+                            Object.entries(scheduleData.candidateAvailability).forEach(([dateKey, times]) => {
+                                scheduleData.candidateAvailability[dateKey] = times.map(t => typeof t === 'number' ? t : timeToMinutes(t));
+                            });
+                        }
+                        if (scheduleData.bookedSlot && typeof scheduleData.bookedSlot.time === 'string') {
+                            scheduleData.bookedSlot.time = timeToMinutes(scheduleData.bookedSlot.time);
+                        }
+                        setSchedule(scheduleData);
                     }
                 } catch (error) {
                     console.error('Error loading schedule:', error);
@@ -526,7 +565,7 @@
                                 <div className="text-green-600 text-4xl mb-4">✅</div>
                                 <h3 className="text-xl font-semibold text-green-800 mb-2">Interview Booked!</h3>
                                 <p className="text-green-700">
-                                    Interview scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{schedule.bookedSlot.time}</strong>
+                                    Interview scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{minutesToTime(schedule.bookedSlot.time)}</strong>
                                 </p>
                             </div>
                         ) : Object.keys(availableSlots).length === 0 ? (
@@ -561,7 +600,7 @@
                                                             disabled={booking}
                                                             className="slot-button bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
                                                         >
-                                                            {booking ? 'Booking...' : time}
+                                                            {booking ? 'Booking...' : minutesToTime(time)}
                                                         </button>
                                                     ))}
                                                 </div>
