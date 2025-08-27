@@ -1,0 +1,503 @@
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot, collection, query, addDoc, deleteDoc, runTransaction, serverTimestamp, orderBy } from 'firebase/firestore';
+
+/**
+ * Scheduler App with graceful fallback when Firebase config is missing.
+ *
+ * Update: Display times in standard US 12‑hour format (e.g., 9:00 AM) in Candidate & Client views
+ * while preserving 24‑hour canonical values (e.g., "09:00") internally for storage and tests.
+ */
+
+// ===== Styles via CDN (for single-file demo) =====
+const externalStylesAndScripts = (
+  <>
+    <style>{`
+      body { margin: 0; font-family: 'Inter', sans-serif; background-color: #0f172a; }
+    `}</style>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>{`
+      tailwind.config = { theme: { extend: { fontFamily: { sans: ['Inter', 'sans-serif'] } } } };
+    `}</script>
+  </>
+);
+
+// ===== Helpers =====
+function resolveFirebaseConfigFromAnywhere() {
+  try {
+    if (typeof window !== 'undefined' && typeof window.__firebase_config !== 'undefined') {
+      const val = window.__firebase_config;
+      if (typeof val === 'string' && val.trim()) return JSON.parse(val);
+      if (val && typeof val === 'object') return val;
+    }
+  } catch (_) {}
+  try {
+    // eslint-disable-next-line no-undef
+    if (typeof __firebase_config !== 'undefined') {
+      // eslint-disable-next-line no-undef
+      const raw = __firebase_config;
+      if (typeof raw === 'string' && raw.trim()) return JSON.parse(raw);
+      if (raw && typeof raw === 'object') return raw;
+    }
+  } catch (_) {}
+  try {
+    const ls = localStorage.getItem('firebaseConfig');
+    if (ls) return JSON.parse(ls);
+  } catch (_) {}
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const cfgParam = params.get('config');
+    if (cfgParam) return JSON.parse(decodeURIComponent(cfgParam));
+  } catch (_) {}
+  try {
+    // @ts-ignore
+    const env = typeof import.meta !== 'undefined' ? import.meta.env : undefined;
+    if (env && env.VITE_FIREBASE_API_KEY && env.VITE_FIREBASE_PROJECT_ID && env.VITE_FIREBASE_APP_ID) {
+      return {
+        apiKey: env.VITE_FIREBASE_API_KEY,
+        authDomain: env.VITE_FIREBASE_AUTH_DOMAIN || `${env.VITE_FIREBASE_PROJECT_ID}.firebaseapp.com`,
+        projectId: env.VITE_FIREBASE_PROJECT_ID,
+        appId: env.VITE_FIREBASE_APP_ID,
+      };
+    }
+  } catch (_) {}
+  return null;
+}
+
+// Convert canonical "HH:MM" to US 12-hour label "h:MM AM/PM"
+function toUS12HourLabel(hhmm) {
+  if (!hhmm || typeof hhmm !== 'string' || !hhmm.includes(':')) return hhmm;
+  const [hStr, mStr] = hhmm.split(':');
+  const h = Number(hStr);
+  const m = Number(mStr);
+  if (Number.isNaN(h) || Number.isNaN(m)) return hhmm;
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const h12 = ((h + 11) % 12) + 1; // 0->12, 13->1, etc.
+  return `${h12}:${m.toString().padStart(2,'0')} ${ampm}`;
+}
+
+// ===== Data Layer Abstraction (works for Firebase or Demo localStorage) =====
+class LocalStore {
+  constructor(appId) { this.appId = appId; this.key = `scheduler_demo_${appId}`; this.listeners = new Set(); this._load(); }
+  _load() { try { const raw = localStorage.getItem(this.key); this.state = raw ? JSON.parse(raw) : { schedules: {} }; } catch { this.state = { schedules: {} }; } }
+  _save() { localStorage.setItem(this.key, JSON.stringify(this.state)); this._emit(); }
+  _emit() { for (const fn of this.listeners) fn(); }
+  listenSchedules(cb) { const handler = () => { const list = Object.entries(this.state.schedules).map(([id,s])=>({id,...s})).sort((a,b)=>(b.createdAt||0)-(a.createdAt||0)); cb(list); }; this.listeners.add(handler); handler(); return ()=>this.listeners.delete(handler); }
+  async createSchedule({ candidateName, clientCompany }) { const id=(crypto?.randomUUID?.()||`${Date.now()}_${Math.random().toString(36).slice(2)}`); this.state.schedules[id]={candidateName,clientCompany,availability:{},bookedSlot:null,createdAt:Date.now()}; this._save(); return id; }
+  async deleteSchedule(id){ delete this.state.schedules[id]; this._save(); }
+  listenScheduleById(id, cb){ const handler=()=>cb(this.state.schedules[id]||null); this.listeners.add(handler); handler(); return ()=>this.listeners.delete(handler); }
+  async submitAvailability(id, availability){ const s=this.state.schedules[id]; if(!s) throw new Error('Schedule not found.'); s.availability=availability||{}; this._save(); }
+  async bookSlot(id,date,slot){ const s=this.state.schedules[id]; if(!s) throw new Error('Schedule not found.'); if(s.bookedSlot) throw new Error('An interview has already been booked for this schedule.'); if(!s.availability?.[date]||!s.availability[date].includes(slot)) throw new Error('The selected slot is no longer available.'); s.bookedSlot={date,time:slot}; this._save(); }
+  getShareUrls(id){ const base=`${window.location.origin}${window.location.pathname}`; return {candidate:`${base}?id=${id}`, client:`${base}?id=${id}&client=true`}; }
+}
+
+class FirestoreStore {
+  constructor(db, appId){ this.db=db; this.appId=appId; }
+  listenSchedules(cb,onErr){ try{ const colRef=collection(this.db,'artifacts',this.appId,'public','data','schedules'); const qy=query(colRef,orderBy('createdAt','desc')); return onSnapshot(qy,(snap)=>{ cb(snap.docs.map(d=>({id:d.id,...d.data()}))); },onErr);}catch(e){ onErr?.(e); return ()=>{}; } }
+  async createSchedule({candidateName,clientCompany}){ const colRef=collection(this.db,'artifacts',this.appId,'public','data','schedules'); const ref=await addDoc(colRef,{candidateName,clientCompany,availability:{},bookedSlot:null,createdAt:serverTimestamp()}); return ref.id; }
+  async deleteSchedule(id){ await deleteDoc(doc(this.db,'artifacts',this.appId,'public','data','schedules',id)); }
+  listenScheduleById(id,cb,onErr){ const ref=doc(this.db,'artifacts',this.appId,'public','data','schedules',id); return onSnapshot(ref,(ds)=>cb(ds.exists()?ds.data():null),onErr); }
+  async submitAvailability(id,availability){ const ref=doc(this.db,'artifacts',this.appId,'public','data','schedules',id); await setDoc(ref,{availability},{merge:true}); }
+  async bookSlot(id,date,slot){ const ref=doc(this.db,'artifacts',this.appId,'public','data','schedules',id); await runTransaction(this.db,async(tx)=>{ const snap=await tx.get(ref); if(!snap.exists()) throw new Error('Schedule not found.'); const data=snap.data(); if(data.bookedSlot) throw new Error('An interview has already been booked for this schedule.'); const avail=data.availability||{}; if(!avail[date]||!avail[date].includes(slot)) throw new Error('The selected slot is no longer available.'); tx.update(ref,{bookedSlot:{date,time:slot}}); }); }
+  getShareUrls(id){ const base=`${window.location.origin}${window.location.pathname}`; return {candidate:`${base}?id=${id}`, client:`${base}?id=${id}&client=true`}; }
+}
+
+// ===== Core App =====
+const App = () => {
+  const resolvedCfg = resolveFirebaseConfigFromAnywhere();
+  const appId = (typeof window !== 'undefined' && window.__app_id) ? window.__app_id : (typeof __app_id !== 'undefined' ? __app_id : 'default-app-id');
+  const initialAuthToken = (typeof window !== 'undefined' && window.__initial_auth_token) ? window.__initial_auth_token : (typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null);
+
+  const [store, setStore] = useState(null); // LocalStore or FirestoreStore
+  const [mode, setMode] = useState(resolvedCfg ? 'firebase' : 'demo');
+
+  const [authReady, setAuthReady] = useState(false);
+  const [loadingApp, setLoadingApp] = useState(true);
+  const [appError, setAppError] = useState(null);
+
+  const [view, setView] = useState('recruiter'); // 'recruiter', 'candidate', 'client'
+  const [scheduleId, setScheduleId] = useState(null);
+
+  const [schedule, setSchedule] = useState(null);
+  const [scheduleLoading, setScheduleLoading] = useState(false);
+  const [scheduleError, setScheduleError] = useState(null);
+
+  const applyViewFromUrl = useCallback(() => {
+    const params = new URLSearchParams(window.location.search);
+    const id = params.get('id');
+    if (id) { setScheduleId(id); setView(params.get('client') ? 'client' : 'candidate'); } else { setView('recruiter'); }
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        applyViewFromUrl();
+        if (resolvedCfg) {
+          const app = initializeApp(resolvedCfg);
+          const firestore = getFirestore(app);
+          const firebaseAuth = getAuth(app);
+          const unsub = onAuthStateChanged(firebaseAuth, async (user) => {
+            if (!user) {
+              try { if (initialAuthToken) await signInWithCustomToken(firebaseAuth, initialAuthToken); else await signInAnonymously(firebaseAuth); }
+              catch (e) { console.error('Authentication failed:', e); setAppError('Authentication failed. Please try again.'); }
+            }
+            setStore(new FirestoreStore(firestore, appId));
+            setAuthReady(true); setLoadingApp(false);
+          });
+          return () => unsub();
+        }
+        setStore(new LocalStore(appId)); setAuthReady(true); setLoadingApp(false);
+      } catch (e) { console.error('Initialization failed:', e); setAppError('Failed to initialize the application.'); setLoadingApp(false); }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!authReady || !store || !scheduleId || (view !== 'candidate' && view !== 'client')) { setSchedule(null); return; }
+    setScheduleLoading(true); setScheduleError(null);
+    const unsubscribe = store.listenScheduleById(
+      scheduleId,
+      (data) => { if (data) { setSchedule(data); setScheduleLoading(false); } else { setScheduleError('Schedule not found.'); setScheduleLoading(false); } },
+      (e) => { console.error('Failed to fetch schedule:', e); setScheduleError('Failed to load schedule. Please try a valid link.'); setScheduleLoading(false); }
+    );
+    return () => unsubscribe?.();
+  }, [authReady, store, scheduleId, view]);
+
+  // Helper: YYYY-MM-DD local date
+  const formatDate = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).toLocaleDateString('en-CA');
+
+  // Time slots 9:00–17:30 canonical values (24h). Labels use US 12‑hour via toUS12HourLabel.
+  const timeSlots = useMemo(() => {
+    const slots = [];
+    for (let i = 9; i <= 17; i++) { slots.push(`${String(i).padStart(2, '0')}:00`); if (i < 17) slots.push(`${String(i).padStart(2, '0')}:30`); }
+    return slots;
+  }, []);
+
+  const nextWorkDays = useMemo(() => {
+    const dates = []; let d = new Date();
+    while (dates.length < 10) { if (d.getDay() !== 0 && d.getDay() !== 6) dates.push(formatDate(d)); d.setDate(d.getDate() + 1); }
+    return dates;
+  }, []);
+
+  // Candidate interaction handlers
+  const handleSlotClick = useCallback((date, slot) => {
+    if (schedule?.bookedSlot) return;
+    setSchedule(prev => {
+      const next = { ...(prev || { availability: {} }) };
+      const avail = { ...(next.availability || {}) };
+      const arr = [...(avail[date] || [])];
+      const idx = arr.indexOf(slot);
+      if (idx >= 0) { arr.splice(idx, 1); if (arr.length === 0) delete avail[date]; else avail[date] = arr; }
+      else { arr.push(slot); avail[date] = arr; }
+      next.availability = avail; return next;
+    });
+  }, [schedule]);
+
+  const handleSubmitAvailability = useCallback(async () => {
+    if (!store || !scheduleId || !schedule) return;
+    setScheduleLoading(true); setScheduleError(null);
+    try { await store.submitAvailability(scheduleId, schedule.availability || {}); }
+    catch (e) { console.error('Error updating availability:', e); setScheduleError('Failed to submit availability.'); }
+    finally { setScheduleLoading(false); }
+  }, [store, scheduleId, schedule]);
+
+  const handleBookSlot = useCallback(async (date, slot) => {
+    if (!store || !scheduleId) return;
+    setScheduleLoading(true); setScheduleError(null);
+    try { await store.bookSlot(scheduleId, date, slot); console.log(`Booked ${date} ${slot}`); }
+    catch (e) { console.error('Error booking slot:', e); setScheduleError(e.message || 'Failed to book the slot.'); }
+    finally { setScheduleLoading(false); }
+  }, [store, scheduleId]);
+
+  // ===== UI atoms =====
+  const Header = ({ title, subtitle }) => (
+    <div className="text-center p-4 bg-white/5 rounded-t-xl">
+      <h1 className="text-2xl font-bold text-slate-100">{title}</h1>
+      <p className="text-sm text-slate-400 mt-1">{subtitle}</p>
+    </div>
+  );
+
+  const Section = ({ title, children }) => (
+    <div className="bg-white/5 p-6 rounded-xl shadow-lg mb-6">
+      <h2 className="text-xl font-semibold text-slate-200 mb-4">{title}</h2>
+      {children}
+    </div>
+  );
+
+  const Button = ({ onClick, children, className = '', ...props }) => (
+    <button onClick={onClick} className={`px-4 py-2 rounded-xl font-medium text-white transition duration-300 transform hover:scale-105 active:scale-95 ${className}`} {...props}>{children}</button>
+  );
+
+  // ===== Top banner: mode + connect firebase panel =====
+  const ConnectFirebasePanel = () => {
+    const [json, setJson] = useState('');
+    const [err, setErr] = useState(null);
+    const save = () => { try { const parsed = JSON.parse(json); localStorage.setItem('firebaseConfig', JSON.stringify(parsed)); window.location.reload(); } catch (e) { setErr('Invalid JSON'); } };
+    const clear = () => { localStorage.removeItem('firebaseConfig'); window.location.reload(); };
+    return (
+      <details className="mb-4">
+        <summary className="cursor-pointer text-slate-300">{mode === 'demo' ? 'Connect Firebase' : 'Switch / Update Firebase Config'}</summary>
+        <div className="mt-3 space-y-2">
+          <textarea value={json} onChange={(e) => setJson(e.target.value)} placeholder='Paste your Firebase config JSON here' className="w-full h-40 p-3 rounded-xl bg-white/5 text-slate-200 border border-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500" />
+          {err && <p className="text-red-400 text-sm">{err}</p>}
+          <div className="flex gap-2">
+            <Button onClick={save} className="bg-emerald-600 hover:bg-emerald-700">Save & Reload</Button>
+            <Button onClick={clear} className="bg-slate-700 hover:bg-slate-600">Clear Stored Config</Button>
+          </div>
+        </div>
+      </details>
+    );
+  };
+
+  // ===== Views =====
+  const RecruiterView = ({ store }) => {
+    const [newCandidateName, setNewCandidateName] = useState('');
+    const [newClientCompany, setNewClientCompany] = useState('');
+    const [allSchedules, setAllSchedules] = useState([]);
+    const [loadingSchedules, setLoadingSchedules] = useState(true);
+    const [schedulesError, setSchedulesError] = useState(null);
+    const [copiedMessage, setCopiedMessage] = useState(null);
+
+    useEffect(() => {
+      if (!store) return; setLoadingSchedules(true);
+      try {
+        const unsub = store.listenSchedules((list) => { setAllSchedules(list); setLoadingSchedules(false); }, (e) => { console.error('Failed to load schedules:', e); setSchedulesError('Failed to load schedules.'); setLoadingSchedules(false); });
+        return () => unsub?.();
+      } catch (e) { console.error('Error wiring schedules listener:', e); setSchedulesError('Error loading recruiter data.'); setLoadingSchedules(false); }
+    }, [store]);
+
+    const handleCreateSchedule = useCallback(async (e) => {
+      e.preventDefault();
+      const candidateName = newCandidateName.trim();
+      const clientCompany = newClientCompany.trim();
+      if (!candidateName || !clientCompany || !store) return;
+      setLoadingSchedules(true); setSchedulesError(null);
+      try { await store.createSchedule({ candidateName, clientCompany }); setNewCandidateName(''); setNewClientCompany(''); }
+      catch (e) { console.error('Error creating schedule:', e); setSchedulesError('Failed to create new schedule.'); }
+      finally { setLoadingSchedules(false); }
+    }, [newCandidateName, newClientCompany, store]);
+
+    const copyToClipboard = useCallback(async (text) => {
+      try { await navigator.clipboard.writeText(text); setCopiedMessage('Link copied!'); }
+      catch { const ta=document.createElement('textarea'); ta.value=text; document.body.appendChild(ta); ta.select(); try{ document.execCommand('copy'); setCopiedMessage('Link copied!'); } catch { setCopiedMessage('Failed to copy link.'); } finally { document.body.removeChild(ta); } }
+      finally { setTimeout(() => setCopiedMessage(null), 2000); }
+    }, []);
+
+    const handleSimulateView = useCallback((targetView, id) => { setScheduleId(id); setView(targetView); }, []);
+
+    return (
+      <div className="max-w-4xl mx-auto p-4 md:p-8">
+        <Header title={`Recruiter Dashboard (${mode === 'demo' ? 'Demo' : 'Firebase'})`} subtitle="Manage and share interview schedules with candidates and clients." />
+        <ConnectFirebasePanel />
+
+        <Section title="Create New Schedule">
+          <form onSubmit={handleCreateSchedule} className="space-y-4">
+            <input type="text" placeholder="Candidate Name" value={newCandidateName} onChange={(e) => setNewCandidateName(e.target.value)} className="w-full p-3 rounded-xl bg-white/5 text-slate-200 border border-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500" />
+            <input type="text" placeholder="Client Company" value={newClientCompany} onChange={(e) => setNewClientCompany(e.target.value)} className="w-full p-3 rounded-xl bg-white/5 text-slate-200 border border-slate-700 focus:outline-none focus:ring-2 focus:ring-emerald-500" />
+            <Button type="submit" className="w-full bg-emerald-600 hover:bg-emerald-700">Create Schedule</Button>
+          </form>
+        </Section>
+
+        {copiedMessage && <div className="fixed bottom-4 right-4 bg-gray-800 text-white px-4 py-2 rounded-xl shadow-lg">{copiedMessage}</div>}
+
+        <Section title="Active Schedules">
+          {loadingSchedules && <p className="text-center text-slate-400">Loading schedules...</p>}
+          {schedulesError && <p className="text-center text-red-400">{schedulesError}</p>}
+          {allSchedules.length === 0 && !loadingSchedules && <p className="text-center text-slate-400">No schedules created yet.</p>}
+          <div className="space-y-4">
+            {allSchedules.map((s) => {
+              const links = store.getShareUrls(s.id);
+              return (
+                <div key={s.id} className="bg-white/10 p-4 rounded-xl shadow-md">
+                  <div className="flex justify-between items-center flex-wrap">
+                    <div className="mb-2 md:mb-0">
+                      <p className="font-semibold text-slate-100">{s.candidateName} at {s.clientCompany}</p>
+                      <p className="text-xs text-slate-400">ID: {s.id}</p>
+                    </div>
+                    <div className="flex flex-col md:flex-row space-y-2 md:space-y-0 md:space-x-2">
+                      <Button onClick={() => handleSimulateView('candidate', s.id)} className="bg-sky-600 hover:bg-sky-700 text-sm">Simulate Candidate View</Button>
+                      <Button onClick={() => handleSimulateView('client', s.id)} className="bg-sky-600 hover:bg-sky-700 text-sm">Simulate Client View</Button>
+                      <Button onClick={() => copyToClipboard(links.candidate)} className="bg-blue-600 hover:bg-blue-700 text-sm">Copy Candidate Link</Button>
+                      <Button onClick={() => copyToClipboard(links.client)} className="bg-purple-600 hover:bg-purple-700 text-sm">Copy Client Link</Button>
+                      <Button onClick={() => store.deleteSchedule(s.id)} className="bg-red-600 hover:bg-red-700 text-sm">Delete</Button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Section>
+
+        <DevPanel store={store} mode={mode} />
+      </div>
+    );
+  };
+
+  const CandidateView = ({ schedule, scheduleLoading, scheduleError, handleSlotClick, handleSubmitAvailability, nextWorkDays, timeSlots }) => {
+    if (scheduleLoading) return <div className="text-center text-slate-400 p-8"><p>Loading schedule...</p></div>;
+    if (scheduleError) return <div className="text-center text-red-400 p-8"><p>Error: {scheduleError}</p></div>;
+    return (
+      <div className="max-w-4xl mx-auto p-4 md:p-8">
+        {schedule && (
+          <>
+            <Header title={`Hi ${schedule.candidateName}!`} subtitle={`Please select your available time slots for an interview with ${schedule.clientCompany}.`} />
+            {schedule.bookedSlot ? (
+              <div className="bg-green-600/30 text-green-200 p-6 rounded-xl text-center font-semibold text-lg">
+                Interview Booked!
+                <p className="text-sm font-normal mt-2">Your interview is confirmed for {schedule.bookedSlot.date} at {toUS12HourLabel(schedule.bookedSlot.time)}.</p>
+              </div>
+            ) : (
+              <>
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 mt-6">
+                  {nextWorkDays.map((date) => (
+                    <div key={date} className="bg-white/5 p-4 rounded-xl shadow-lg">
+                      <h3 className="font-semibold text-slate-100 mb-2">{date}</h3>
+                      <div className="flex flex-wrap gap-2">
+                        {timeSlots.map((slot) => (
+                          <div key={slot} onClick={() => handleSlotClick(date, slot)} className={`px-3 py-1 rounded-full text-xs font-medium cursor-pointer transition ${schedule.availability?.[date]?.includes(slot) ? 'bg-emerald-600 text-white' : 'bg-white/10 text-slate-300 hover:bg-white/20'}`}>{toUS12HourLabel(slot)}</div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="text-center mt-6">
+                  <Button onClick={handleSubmitAvailability} className="bg-blue-600 hover:bg-blue-700">Submit Availability</Button>
+                </div>
+              </>
+            )}
+          </>
+        )}
+        <div className="mt-8 text-center">
+          <Button onClick={() => { setView('recruiter'); setScheduleId(null); }} className="bg-slate-700 hover:bg-slate-600">Go Back to Recruiter View</Button>
+        </div>
+      </div>
+    );
+  };
+
+  const ClientView = ({ schedule, scheduleLoading, scheduleError, handleBookSlot }) => {
+    if (scheduleLoading) return <div className="text-center text-slate-400 p-8"><p>Loading schedule...</p></div>;
+    if (scheduleError) return <div className="text-center text-red-400 p-8"><p>Error: {scheduleError}</p></div>;
+    return (
+      <div className="max-w-4xl mx-auto p-4 md:p-8">
+        {schedule && (
+          <>
+            <Header title={`Hi from ${schedule.clientCompany}!`} subtitle={`Select an available time slot for ${schedule.candidateName}.`} />
+            {schedule.bookedSlot ? (
+              <div className="bg-green-600/30 text-green-200 p-6 rounded-xl text-center font-semibold text-lg">
+                Interview Booked!
+                <p className="text-sm font-normal mt-2">An interview with {schedule.candidateName} is confirmed for {schedule.bookedSlot.date} at {toUS12HourLabel(schedule.bookedSlot.time)}.</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4 mt-6">
+                {Object.keys(schedule.availability || {}).map((date) => (
+                  <div key={date} className="bg-white/5 p-4 rounded-xl shadow-lg">
+                    <h3 className="font-semibold text-slate-100 mb-2">{date}</h3>
+                    <div className="flex flex-wrap gap-2">
+                      {(schedule.availability?.[date] || []).map((slot) => (
+                        <div key={slot} onClick={() => handleBookSlot(date, slot)} className="px-3 py-1 rounded-full text-xs font-medium cursor-pointer transition bg-emerald-600 text-white hover:bg-emerald-700">{toUS12HourLabel(slot)}</div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+        <div className="mt-8 text-center">
+          <Button onClick={() => { setView('recruiter'); setScheduleId(null); }} className="bg-slate-700 hover:bg-slate-600">Go Back to Recruiter View</Button>
+        </div>
+      </div>
+    );
+  };
+
+  // ===== Dev self-tests =====
+  function DevPanel({ store, mode }) {
+    const [log, setLog] = useState([]);
+    const [running, setRunning] = useState(false);
+    const [allowFirebaseWrites, setAllowFirebaseWrites] = useState(false);
+
+    const append = (m) => setLog((prev) => [...prev, m]);
+
+    const run = async () => {
+      if (!store) return;
+      if (mode !== 'demo' && !allowFirebaseWrites) { append('⚠️ Skipping: enable "Allow writes in Firebase mode" to run tests.'); return; }
+      setRunning(true); setLog([]);
+      try {
+        append('▶️ Self-tests started');
+        const id = await store.createSchedule({ candidateName: 'TEST__Cand', clientCompany: 'TEST__Co' });
+        append(`✅ Created schedule ${id}`);
+        let saw = false; const unsub = store.listenSchedules((list) => { if (list.find((x) => x.id === id)) saw = true; });
+        await new Promise((r) => setTimeout(r, 100)); unsub?.();
+        append(saw ? '✅ Schedule visible in list' : '❌ Schedule not visible in list');
+        const date = new Date(); const dStr = new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1).toLocaleDateString('en-CA');
+        await store.submitAvailability(id, { [dStr]: ['09:00', '09:30'] });
+        append('✅ Availability submitted');
+        await store.bookSlot(id, dStr, '09:00'); append('✅ Slot booked');
+        let doubleBooked = false; try { await store.bookSlot(id, dStr, '09:30'); doubleBooked = true; } catch {}
+        append(!doubleBooked ? '✅ Prevented double booking' : '❌ Double booking was allowed');
+        await store.deleteSchedule(id); append('✅ Deleted test schedule');
+        append('🎉 All tests completed');
+      } catch (e) { console.error(e); append(`❌ Test failed: ${e.message || e}`); } finally { setRunning(false); }
+    };
+
+    return (
+      <Section title="Developer Self-Tests">
+        {mode !== 'demo' && (
+          <label className="flex items-center gap-2 text-slate-300 mb-2">
+            <input type="checkbox" checked={allowFirebaseWrites} onChange={(e) => setAllowFirebaseWrites(e.target.checked)} />
+            Allow writes in Firebase mode (creates & deletes temporary test data)
+          </label>
+        )}
+        <Button onClick={run} disabled={running} className={` ${running ? 'bg-slate-700' : 'bg-slate-600 hover:bg-slate-500'}`}>{running ? 'Running…' : 'Run self-tests'}</Button>
+        <div className="mt-3 p-3 bg-black/30 rounded-xl text-xs text-slate-300 whitespace-pre-wrap min-h-[80px]">{log.join('\n')}</div>
+      </Section>
+    );
+  }
+
+  if (loadingApp) {
+    return <div className="flex justify-center items-center h-screen bg-slate-900 text-slate-100"><p>Connecting…</p></div>;
+  }
+  if (appError) {
+    return <div className="flex justify-center items-center h-screen bg-slate-900 text-red-400"><p>Error: {appError}</p></div>;
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-900 text-slate-100 font-sans p-4">
+      {externalStylesAndScripts}
+      <div className="min-h-screen flex justify-center items-center">
+        {(() => {
+          switch (view) {
+            case 'recruiter':
+              return <RecruiterView store={store} />;
+            case 'candidate':
+              return (
+                <CandidateView
+                  schedule={schedule}
+                  scheduleLoading={scheduleLoading}
+                  scheduleError={scheduleError}
+                  handleSlotClick={handleSlotClick}
+                  handleSubmitAvailability={handleSubmitAvailability}
+                  nextWorkDays={nextWorkDays}
+                  timeSlots={timeSlots}
+                />
+              );
+            case 'client':
+              return (
+                <ClientView
+                  schedule={schedule}
+                  scheduleLoading={scheduleLoading}
+                  scheduleError={scheduleError}
+                  handleBookSlot={handleBookSlot}
+                />
+              );
+            default:
+              return <p className="text-center text-slate-400">Invalid view specified.</p>;
+          }
+        })()}
+      </div>
+    </div>
+  );
+};
+
+export default App;
