@@ -68,10 +68,51 @@
             const slots = [];
             for (let hour = 9; hour < 17; hour++) {
                 for (let minute = 0; minute < 60; minute += 30) {
-                    slots.push(hour * 60 + minute);
+const generateTimeSlots = () => {
+  const slots = [];
+  for (let hour = 9; hour < 17; hour++) {
+    for (let minute = 0; minute < 60; minute += 30) {
+      // store as integer minutes since midnight
+      slots.push(hour * 60 + minute);
+    }
+  }
+  return slots;
+};
+
+// 12-hour display; accepts integer minutes or {hour, minute}
+const formatTime = (time) => {
+  let mins;
+  if (typeof time === 'number') {
+    mins = time;
+  } else if (time && typeof time === 'object') {
+    mins = (time.hour || 0) * 60 + (time.minute || 0);
+  } else {
+    mins = 0;
+  }
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  const dt = new Date(Date.UTC(1970, 0, 1, h, m));
+  return new Intl.DateTimeFormat('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true
+  }).format(dt);
+};
+
                 }
             }
             return slots;
+        };
+
+        const formatTime = ({ hour, minute }) => {
+            const date = new Date();
+            date.setHours(hour);
+            date.setMinutes(minute);
+            return new Intl.DateTimeFormat('en-US', {
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true
+            }).format(date);
         };
 
         const getNextWorkdays = (count = 7) => {
@@ -309,7 +350,12 @@
                                                 </p>
                                                 {schedule.bookedSlot && (
                                                     <div className="mt-2 inline-block bg-green-100 text-green-800 px-3 py-1 rounded-full text-sm font-medium">
-                                                        Interview Booked: {schedule.bookedSlot.date} at {minutesToTime(schedule.bookedSlot.time)}
+{schedule.bookedSlot && (
+  <div className="mt-2 inline-block bg-green-100 text-green-800 px-3 py-1 rounded-full text-sm font-medium">
+    Interview Booked: {schedule.bookedSlot.date} at {formatTime(schedule.bookedSlot.time)}
+  </div>
+)}
+
                                                     </div>
                                                 )}
                                             </div>
@@ -437,15 +483,17 @@ if (doc.exists) {
 
             const toggleSlot = (date, time) => {
                 if (schedule.bookedSlot) return; // Prevent changes if interview is booked
-                
+
                 const dateKey = date.toISOString().split('T')[0];
                 const newSelectedSlots = { ...selectedSlots };
-                
+
                 if (!newSelectedSlots[dateKey]) {
                     newSelectedSlots[dateKey] = [];
                 }
-                
-                const slotIndex = newSelectedSlots[dateKey].indexOf(time);
+
+                const slotIndex = newSelectedSlots[dateKey].findIndex(
+                    t => t.hour === time.hour && t.minute === time.minute
+                );
                 if (slotIndex > -1) {
                     newSelectedSlots[dateKey].splice(slotIndex, 1);
                     if (newSelectedSlots[dateKey].length === 0) {
@@ -454,7 +502,7 @@ if (doc.exists) {
                 } else {
                     newSelectedSlots[dateKey].push(time);
                 }
-                
+
                 setSelectedSlots(newSelectedSlots);
             };
 
@@ -499,7 +547,11 @@ if (doc.exists) {
                                 <div className="text-green-600 text-4xl mb-4">✅</div>
                                 <h3 className="text-xl font-semibold text-green-800 mb-2">Interview Confirmed!</h3>
                                 <p className="text-green-700">
-                                    Your interview is scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{minutesToTime(schedule.bookedSlot.time)}</strong>
+<p className="text-green-700">
+  Your interview is scheduled for <strong>{schedule.bookedSlot.date}</strong> at&nbsp;
+  <strong>{formatTime(schedule.bookedSlot.time)}</strong>
+</p>
+
                                 </p>
                             </div>
                         ) : (
@@ -520,18 +572,20 @@ if (doc.exists) {
                                                 </h3>
                                                 <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3">
                                                     {timeSlots.map(time => {
-                                                        const isSelected = selectedSlots[dateKey]?.includes(time);
+                                                        const isSelected = selectedSlots[dateKey]?.some(
+                                                            t => t.hour === time.hour && t.minute === time.minute
+                                                        );
                                                         return (
                                                             <button
-                                                                key={time}
+                                                                key={`${time.hour}-${time.minute}`}
                                                                 onClick={() => toggleSlot(date, time)}
                                                                 className={`slot-button px-4 py-2 rounded-lg text-sm font-medium ${
                                                                     isSelected
                                                                         ? 'bg-blue-600 text-white'
                                                                         : 'bg-white border border-gray-300 text-gray-700 hover:bg-blue-50'
-                                                                }`}
-                                                            >
-                                                                {minutesToTime(time)}
+                                                                }`
+{formatTime(time)}
+
                                                             </button>
                                                         );
                                                     })}
@@ -698,7 +752,8 @@ if (doc.exists) {
                                 <div className="text-green-600 text-4xl mb-4">✅</div>
                                 <h3 className="text-xl font-semibold text-green-800 mb-2">Interview Booked!</h3>
                                 <p className="text-green-700">
-                                    Interview scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{minutesToTime(schedule.bookedSlot.time)}</strong>
+Interview scheduled for <strong>{schedule.bookedSlot.date}</strong> at <strong>{formatTime(schedule.bookedSlot.time)}</strong>
+
                                 </p>
                             </div>
                         ) : Object.keys(availableSlots).length === 0 ? (
@@ -732,8 +787,8 @@ if (doc.exists) {
                                                             onClick={() => bookSlot(dateKey, time)}
                                                             disabled={booking}
                                                             className="slot-button bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
-                                                        >
-                                                            {booking ? 'Booking...' : minutesToTime(time)}
+{booking ? 'Booking...' : formatTime(time)}
+
                                                         </button>
                                                     ))}
                                                 </div>
